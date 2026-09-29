@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Drive the Pigeon (v2) from the Mac over USB serial via the Nest dongle.
+
+No Bluetooth, no daemon, no TCC: the Nest enumerates as a plain CDC serial
+device, so this just opens /dev/cu.usbmodem* and writes framed commands, which
+the Nest relays to the Pigeon over the 2.4 GHz radio (reliable, ARQ). Framing
+and key tables are reused from pigeon.py so the keymap lives in one place.
+
+    ./pigeon-send type "Hello, World!"      # type a string
+    ./pigeon-send type --enter "run this"   # ...and press Enter after
+    ./pigeon-send key enter                 # tap a named key
+    ./pigeon-send key up up down enter      # several, in order
+    ./pigeon-send combo cmd c               # Cmd+C
+    ./pigeon-send combo cmd shift 4         # Cmd+Shift+4
+    ./pigeon-send read 3                     # read 3s of the target's serial output
+    ./pigeon-send serial "ls -la"            # send raw bytes to the target's port
+    ./pigeon-send profile linux              # set the layout profile
+    ./pigeon-send hidtune 3,3                # tune emitter press,gap (ms)
+
+  Clipboard bridge:
+    ./pigeon-send paste                     # type the Mac clipboard onto the target
+    ./pigeon-send paste --enter             # ...and press Enter after
+    ./pigeon-send copy 5                     # 5s of target serial -> Mac clipboard
+
+  Diagnostics / advanced:
+    ./pigeon-send status                    # Pigeon role + link telemetry (rssi, retx)
+    ./pigeon-send hold w                     # press+hold a key (games); 'hold shift w' too
+    ./pigeon-send release                    # release all held keys
+    ./pigeon-send script login.txt           # run a sequence of commands from a file
+    ./pigeon-send flashmode                  # reboot THIS board into the ROM download
+                                              # bootloader (VID 303A PID 1001), for esptool
+    ./pigeon-send flashmode peer             # ask the paired Pigeon to do the same
+
+  Link key (Stage 4 security -- both sticks must hold the SAME key, and a
+  board with no key fails closed: it pairs with nothing and types nothing):
+    ./pigeon-send gen-key                   # make a key, save it to ~/.pigeon_link_key
+    ./pigeon-send set-key                    # write that key to the attached board
+    ./pigeon-send local-status               # what key/role does THIS board hold?
+    ./pigeon-send clear-key                  # forget the key on the attached board
+  Provisioning is USB-only and never crosses the radio. Run gen-key once, then
+  plug in each stick in turn and run set-key; local-status on both should print
+  the same fingerprint.
+
+  Swappable roles (one firmware; boards decide Nest/Pigeon at runtime):
+    ./pigeon-send set-nest                  # make THIS board (on the Mac) the Nest
+    ./pigeon-send set-pigeon                 # ...or the Pigeon (reboots to HID)
+    ./pigeon-send reset-role                 # clear THIS board's role (-> unset)
+    ./pigeon-send reset-both                 # clear BOTH boards (for swapping)
+  set-nest is the one you normally run: designate the Nest, and the other board
+  hears it over the radio and becomes the Pigeon on its own. The board reboots to
+  apply, so the serial port drops briefly.
+"""
+import os
+import secrets
+import subprocess
+import sys
+import time
+
+import serial
+from serial.tools import list_ports
+
+import pigeon as P  # framing + key tables (no bleak needed to import)
+
+PIGEON_VID = 0x303A
+NEST_PID = 0x4006    # Nest / UNSET (CDC only)
+PIGEON_PID = 0x4005  # Pigeon (HID + CDC), e.g. when reassigning one on the Mac
+# Keep each frame within one ESP-NOW packet (225 B payload once the Stage 4
+# counter and tag are spent; frame + verb take ~10 B more), matching the
+# firmware's per-packet cap.
+TYPE_CHUNK = 180
+
+# Where gen-key parks the link key so set-key can write the SAME one to both
+# sticks. Owner-readable only; it is the secret that keeps the radio honest.
+KEY_FILE = os.path.expanduser("~/.pigeon_link_key")
+KEY_BYTES = 32
+
+
+def find_port():
+    """Board on the Mac: prefer the Nest (0x4006); fall back to a Pigeon (0x4005)
+    so role commands can also reach a Pigeon plugged in for reassignment."""
+    ports = list(list_ports.comports())
+    for p in ports:
+        if p.vid == PIGEON_VID and p.pid == NEST_PID:
+            return p.device
+    for p in ports:
+        if p.vid == PIGEON_VID and p.pid == PIGEON_PID:
+            return p.device
+    return None
+
+
+def key_frame(modifier, keycode):
+    return P.frame_control(f"KEY:{modifier:02x},{keycode:02x}")
+
+
+def resolve_key(name):
+    """A named key or a single character -> (modifier, keycode), or None."""
+    low = name.lower()
+    if low in P.KEYS:
+        return (0x00, P.KEYS[low])
+    if len(name) == 1:
+        return P.char_to_report(name)
+    return None
+
+
+def resolve_combo(tokens):
+    """Modifiers then one final key: 'cmd shift 4' -> (mod, keycode)."""
+    *mods, final = tokens
+    modifier = 0
+    for m in mods:
+        if m.lower() not in P.MOD:
+            sys.exit(f"unknown modifier {m!r} (ctrl/shift/alt/cmd)")
+        modifier |= P.MOD[m.lower()]
+    base = resolve_key(final)
+    if base is None:
+        sys.exit(f"unknown final key {final!r}")
+    base_mod, keycode = base
+    return (modifier | base_mod, keycode)
+
+
+def frames_for(argv):
+    """Turn a command line into a list of frames to send (in order)."""
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "type":
+        enter = False
+        if rest and rest[0] == "--enter":
+            enter, rest = True, rest[1:]
+        text = " ".join(rest) + ("\n" if enter else "")
+        return [P.frame_control("TYPE:" + text[i:i + TYPE_CHUNK])
+                for i in range(0, len(text), TYPE_CHUNK)] or [P.frame_control("TYPE:")]
+
+    if cmd == "key":
+        frames = []
+        for name in rest:
+            r = resolve_key(name)
+            if r is None:
+                sys.exit(f"unknown key {name!r} (see KEYS in pigeon.py)")
+            frames.append(key_frame(*r))
+        return frames
+
+    if cmd == "combo":
+        if not rest:
+            sys.exit("combo needs at least a key")
+        return [key_frame(*resolve_combo(rest))]
+
+    if cmd == "hold":
+        if not rest:
+            sys.exit("hold needs a key, e.g. 'hold w' or 'hold shift w'")
+        r = resolve_combo(rest) if len(rest) > 1 else resolve_key(rest[0])
+        if r is None:
+            sys.exit(f"unknown key {rest!r}")
+        return [P.frame_control(f"KEYHOLD:{r[0]:02x},{r[1]:02x}")]
+
+    if cmd == "release":
+        return [P.frame_control("KEYUP:")]
+
+    if cmd == "serial":
+        return [P.frame_data((" ".join(rest)).encode())]
+
+    if cmd == "serialhex":
+        return [P.frame_data(bytes(int(b, 16) for b in rest))]
+
+    if cmd == "profile":
+        return [P.frame_control("PROFILE:" + (rest[0] if rest else ""))]
+
+    if cmd == "hidtune":
+        return [P.frame_control("HIDTUNE:" + (rest[0] if rest else ""))]
+
+    # Role designation. set-* / reset-role act on THIS board; reset-peer is
+    # relayed over the radio to the paired Pigeon. The board reboots to apply.
+    if cmd == "set-nest":
+        return [P.frame_control("ROLE:nest")]
+    if cmd == "set-pigeon":
+        return [P.frame_control("ROLE:pigeon")]
+    if cmd == "reset-role":
+        return [P.frame_control("ROLE:unset")]
+    if cmd == "reset-both":
+        return [P.frame_control("RESETPAIR:1")]
+
+    # FLASHMODE:local reboots the board on this USB port into the ESP32-S3's
+    # ROM download bootloader (VID 0x303A PID 0x1001), ready for esptool.
+    # FLASHMODE:peer asks the paired Pigeon to do the same over the radio.
+    if cmd == "flashmode":
+        target = rest[0] if rest else "local"
+        if target not in ("local", "peer"):
+            sys.exit("flashmode takes no target (this board) or 'peer' (the paired Pigeon)")
+        return [P.frame_control("FLASHMODE:" + target)]
+
+    return None
+
+
+def do_read(port, secs):
+    """Deframe and print whatever the target sends up over the link."""
+    df = P.Deframer()
+    with serial.Serial(port, 115200, timeout=0.2, dsrdtr=True) as s:
+        s.dtr = True
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            b = s.read(128)
+            for ftype, payload in df.feed(b):
+                kind = "CTRL" if ftype == P.FRAME_TYPE_CONTROL else "DATA"
+                text = payload.decode("utf-8", "replace")
+                print(f"[{kind}] {text}", end="" if kind == "DATA" else "\n")
+    return 0
+
+
+def do_paste(port, enter):
+    """Paste to Pigeon: type the Mac clipboard into the target's focused field.
+    ASCII + space/tab/newline only (the keymap's range); other characters are
+    dropped by the firmware with a warning. Best for smallish blocks of text."""
+    _require_paired(port, "paste")
+    text = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    if enter:
+        text += "\n"
+    if not text:
+        print("clipboard empty; nothing to paste")
+        return 0
+    frames = [P.frame_control("TYPE:" + text[i:i + TYPE_CHUNK])
+              for i in range(0, len(text), TYPE_CHUNK)]
+    with serial.Serial(port, 115200, timeout=1.0, dsrdtr=True) as s:
+        s.dtr = True
+        time.sleep(0.1)
+        for f in frames:
+            s.write(f)
+            time.sleep(0.02)
+    print(f"pasted {len(text)} chars to the target ({len(frames)} frame(s))")
+    return 0
+
+
+def fingerprint(key):
+    """The same short public fingerprint the firmware reports: the first four
+    bytes of SHA-256 over the key. Safe to print -- it identifies a key without
+    revealing it, which is what makes comparing two sticks possible."""
+    import hashlib
+    return hashlib.sha256(key).hexdigest()[:8]
+
+
+def load_key():
+    if not os.path.exists(KEY_FILE):
+        sys.exit(f"no link key at {KEY_FILE} -- run './pigeon-send gen-key' first")
+    with open(KEY_FILE) as f:
+        text = f.read().strip()
+    try:
+        key = bytes.fromhex(text)
+    except ValueError:
+        sys.exit(f"{KEY_FILE} is not hex -- regenerate it with gen-key --force")
+    if len(key) != KEY_BYTES:
+        sys.exit(f"{KEY_FILE} holds {len(key)} bytes, expected {KEY_BYTES}")
+    return key
+
+
+def do_gen_key(force):
+    """Mint a link key and save it locally. Deliberately does NOT touch a board:
+    the same key has to reach both sticks, so generation and provisioning are
+    separate steps."""
+    if os.path.exists(KEY_FILE) and not force:
+        sys.exit(f"{KEY_FILE} already exists (fingerprint {fingerprint(load_key())}).\n"
+                 "Overwriting it strands any board already holding the old key.\n"
+                 "Re-run with --force if that is what you want.")
+    key = secrets.token_bytes(KEY_BYTES)
+    # Write owner-only from the start rather than chmod-ing after: never leave
+    # the key world-readable, even for an instant.
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key.hex() + "\n")
+    print(f"new link key saved to {KEY_FILE} (fingerprint {fingerprint(key)})")
+    print("Now plug in each stick in turn and run './pigeon-send set-key'.")
+    return 0
+
+
+def do_set_key(port):
+    """Write the local link key to the attached board over USB. Never goes over
+    the radio -- the firmware refuses a LINKKEY that arrives that way."""
+    key = load_key()
+    print(f"writing link key {fingerprint(key)} to {port} ...")
+    return _local_command(port, "LINKKEY:" + key.hex(),
+                          "no reply -- is the board plugged in and booted?")
+
+
+def do_clear_key(port):
+    return _local_command(port, "LINKKEY:clear",
+                          "no reply -- is the board plugged in and booted?")
+
+
+def do_local_status(port):
+    return _local_command(port, "LOCALSTATUS:",
+                          "no reply -- is the board plugged in and booted?")
+
+
+def _local_command(port, verb, on_timeout):
+    """Send a board-LOCAL control verb and print the board's own reply. These
+    are answered by the stick on the other end of the USB cable, not relayed to
+    the Pigeon, so they work even while the radio is failed closed."""
+    df = P.Deframer()
+    with serial.Serial(port, 115200, timeout=0.2, dsrdtr=True) as s:
+        s.dtr = True
+        time.sleep(0.1)
+        s.write(P.frame_control(verb))
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            for ftype, payload in df.feed(s.read(128)):
+                if ftype != P.FRAME_TYPE_CONTROL:
+                    continue
+                text = payload.decode("utf-8", "replace")
+                print(text)
+                return 1 if text.startswith("ERR:") else 0
+    print(on_timeout)
+    return 1
+
+
+def do_status(port):
+    """Ask the Pigeon for its role + link telemetry and print the reply."""
+    df = P.Deframer()
+    with serial.Serial(port, 115200, timeout=0.2, dsrdtr=True) as s:
+        s.dtr = True
+        time.sleep(0.1)
+        s.write(P.frame_control("STATUS:"))
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            for ftype, payload in df.feed(s.read(128)):
+                if ftype == P.FRAME_TYPE_CONTROL and payload.startswith(b"STATUS:"):
+                    print(payload.decode("utf-8", "replace"))
+                    return 0
+    print("no status reply -- is the Pigeon paired and powered?")
+    return 1
+
+
+def do_script(port, path):
+    """Run a sequence of pigeon-send commands from a file over one connection.
+    Each line is a command (type/key/combo/hold/release/serial/...); a line
+    `sleep <secs>` pauses; blank lines and #-comments are ignored."""
+    _require_paired(port, "script")
+    lines = open(path).read().splitlines()
+    with serial.Serial(port, 115200, timeout=1.0, dsrdtr=True) as s:
+        s.dtr = True
+        time.sleep(0.1)
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if parts[0] == "sleep":
+                time.sleep(float(parts[1]))
+                continue
+            frames = frames_for(parts)
+            if frames is None:
+                sys.exit(f"script: unknown command {line!r}")
+            for f in frames:
+                s.write(f)
+                time.sleep(0.02)
+    print(f"ran script {path}")
+    return 0
+
+
+def do_copy(port, secs):
+    """Copy from Pigeon: collect the target's serial output for `secs` and put it
+    on the Mac clipboard (pbcopy). The target has to emit the text to its serial
+    console (e.g. `cat file > /dev/ttyACM0`, or a command Pigeon typed)."""
+    df = P.Deframer()
+    chunks = []
+    with serial.Serial(port, 115200, timeout=0.2, dsrdtr=True) as s:
+        s.dtr = True
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            b = s.read(128)
+            for ftype, payload in df.feed(b):
+                if ftype == P.FRAME_TYPE_DATA:
+                    chunks.append(payload)
+    data = b"".join(chunks)
+    subprocess.run(["pbcopy"], input=data)
+    print(f"copied {len(data)} bytes from the target to the Mac clipboard")
+    return 0
+
+
+# Commands whose frames are relayed over the radio to the Pigeon. If the link is
+# not paired they are silently dropped there, so we refuse them up front instead
+# of printing a false "sent". Role/pairing verbs (set-nest, set-pigeon,
+# reset-role, reset-both) are deliberately absent: you run those precisely to
+# establish or reset a link, i.e. while it is not yet paired.
+RADIO_DELIVERY_CMDS = {"type", "key", "combo", "hold", "release",
+                       "serial", "serialhex", "profile", "hidtune"}
+
+
+def _query_paired(port):
+    """The local Nest's own paired flag (True/False), or None if it does not
+    answer. Uses the board-LOCAL LOCALSTATUS verb, which is answered by the stick
+    on this cable rather than relayed, so it works even when the radio is down."""
+    df = P.Deframer()
+    try:
+        with serial.Serial(port, 115200, timeout=0.2, dsrdtr=True) as s:
+            s.dtr = True
+            time.sleep(0.1)
+            s.write(P.frame_control("LOCALSTATUS:"))
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                for ftype, payload in df.feed(s.read(128)):
+                    if ftype != P.FRAME_TYPE_CONTROL:
+                        continue
+                    for tok in payload.decode("utf-8", "replace").split():
+                        if tok.startswith("paired="):
+                            return tok[len("paired="):].startswith("1")
+    except Exception:
+        return None
+    return None
+
+
+def _require_paired(port, what):
+    """Abort a radio-delivery command when the link is provably down. A None
+    (no telemetry reply) is treated as 'proceed' -- we only block on a definite
+    paired=0, so a telemetry hiccup never wrongly stops a working link."""
+    if _query_paired(port) is False:
+        sys.exit(f"link not paired -- '{what}' would be dropped at the radio and "
+                 "never reach the target.\n"
+                 "  - check the key: ./pigeon-send local-status on each stick "
+                 "(fingerprints must match)\n"
+                 "  - check roles are set: ./pigeon-send status\n"
+                 "Provision with gen-key/set-key, then set-nest, before typing.")
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 1
+
+    cmd = argv[1]
+
+    # gen-key only mints a key on this Mac, so it must work with nothing
+    # plugged in -- you normally run it before touching either stick.
+    if cmd == "gen-key":
+        return do_gen_key(force=("--force" in argv[2:]))
+
+    port = find_port()
+    if not port:
+        sys.exit("no Pigeon board found on USB (VID 303A, PID 4006 Nest / 4005 "
+                 "Pigeon) -- plugged in and booted?")
+
+    if cmd == "read":
+        secs = float(argv[2]) if len(argv) > 2 else 3.0
+        return do_read(port, secs)
+    if cmd == "paste":
+        return do_paste(port, enter=("--enter" in argv[2:]))
+    if cmd == "copy":
+        secs = float(argv[2]) if len(argv) > 2 and argv[2][0].isdigit() else 3.0
+        return do_copy(port, secs)
+    if cmd == "status":
+        return do_status(port)
+    if cmd == "set-key":
+        return do_set_key(port)
+    if cmd == "clear-key":
+        return do_clear_key(port)
+    if cmd == "local-status":
+        return do_local_status(port)
+    if cmd == "script":
+        if len(argv) < 3:
+            sys.exit("script needs a file path")
+        return do_script(port, argv[2])
+
+    if cmd in RADIO_DELIVERY_CMDS:
+        _require_paired(port, cmd)
+    if cmd == "flashmode" and len(argv) > 2 and argv[2] == "peer":
+        _require_paired(port, "flashmode peer")
+
+    frames = frames_for(argv[1:])
+    if frames is None:
+        sys.exit(f"unknown command {cmd!r}\n{__doc__}")
+
+    with serial.Serial(port, 115200, timeout=1.0, dsrdtr=True) as s:
+        s.dtr = True
+        time.sleep(0.1)
+        for f in frames:
+            s.write(f)
+            time.sleep(0.02)
+    print(f"sent {len(frames)} frame(s) to {port}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

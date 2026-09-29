@@ -1,0 +1,21 @@
+# Bluetooth stays off. v1 drove the board over BLE (NimBLE); v2 is a 2.4 GHz
+# ESP-NOW link and link_ble.c was deleted in Stage 7, so nothing references a
+# Bluetooth API any more. Leaving the controller enabled reserved its RAM and
+# built a stack the linker then discarded.
+CONFIG_BT_ENABLED=n
+CONFIG_TINYUSB_HID_COUNT=1
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+# 1 kHz tick so pdMS_TO_TICKS resolves single-millisecond delays instead of
+# flooring everything under 10 ms to zero. At the old 100 Hz default a tick is
+# 10 ms: the HID emitter's press/gap and bridge_task's 2 ms period all rounded
+# to 0 or snapped to 10 ms boundaries, which is what produced the phantom
+# "6,8 vs 8,10" typing cliff.
+CONFIG_FREERTOS_HZ=1000
+
+# Stage 4 link security (linkcrypt.c). ChaCha20-Poly1305 is the AEAD on every
+# radio record; it is not in the default mbedTLS feature set, so switch it on.
+# HKDF needs no switch here -- it comes with the PSA layer and the linker keeps
+# it because linkcrypt derives session keys through it.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y

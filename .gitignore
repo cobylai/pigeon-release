@@ -1,0 +1,32 @@
+# general
+.DS_Store
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+
+# embedded / esp / platformio
+.pio/
+build/
+build_*/
+.cache/
+
+# vscode
+.vscode/
+
+# link keys -- the secret that keeps the radio honest. gen-key writes to
+# ~/.pigeon_link_key, outside the repo, but never let a stray copy be committed.
+.pigeon_link_key
+*.key
+
+# idf.py rewrites this on every reconfigure; it is a build artifact, not config.
+sdkconfig.old
+
+# ESP-IDF fetches these from dependencies.lock on first build; not our source.
+managed_components/
+# generated from sdkconfig.defaults on every build
+sdkconfig
